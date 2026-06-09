@@ -1,0 +1,165 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-edge:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux
+            arch: x86_64
+          - os: windows-latest
+            target: windows
+            arch: x86_64
+          - os: macos-latest
+            target: macos-intel
+            arch: x86_64
+          - os: macos-latest
+            target: macos-arm
+            arch: aarch64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout n2n
+        uses: actions/checkout@v4
+        with:
+          repository: ntop/n2n
+          path: n2n
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential autoconf libtool
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install autoconf automake libtool
+
+      - name: Build edge (Linux)
+        if: matrix.target == 'linux'
+        run: |
+          cd n2n
+          ./autogen.sh
+          ./configure
+          make
+          cp edge ../edge-x86_64-unknown-linux-gnu
+
+      - name: Build edge (Windows)
+        if: matrix.target == 'windows'
+        run: |
+          cd n2n
+          # Windows 使用 MSYS2 或 Visual Studio 编译
+          # 这里简化处理，实际需要配置 Windows 编译环境
+          echo "Windows compilation needs manual setup"
+
+      - name: Build edge (macOS Intel)
+        if: matrix.target == 'macos-intel'
+        run: |
+          cd n2n
+          ./autogen.sh
+          ./configure CFLAGS="-arch x86_64" LDFLAGS="-arch x86_64"
+          make
+          cp edge ../edge-x86_64-apple-darwin
+          chmod +x ../edge-x86_64-apple-darwin
+
+      - name: Build edge (macOS ARM)
+        if: matrix.target == 'macos-arm'
+        run: |
+          cd n2n
+          ./autogen.sh
+          ./configure CFLAGS="-arch arm64" LDFLAGS="-arch arm64"
+          make
+          cp edge ../edge-aarch64-apple-darwin
+          chmod +x ../edge-aarch64-apple-darwin
+
+      - name: Upload edge binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: edge-${{ matrix.target }}
+          path: edge-*
+
+  build-tauri:
+    needs: build-edge
+    strategy:
+      matrix:
+        platform:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+
+    runs-on: ${{ matrix.platform.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.target }}
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev librsvg2-dev
+
+      - name: Download edge binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Place edge binary
+        run: |
+          mkdir -p src-tauri/binaries
+          cp artifacts/edge-*/* src-tauri/binaries/
+
+      - name: Install frontend dependencies
+        run: bun install
+
+      - name: Build Tauri app
+        run: bun run tauri build --target ${{ matrix.platform.target }}
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: anyn2n-${{ matrix.platform.target }}
+          path: |
+            src-tauri/target/${{ matrix.platform.target }}/release/bundle/
+
+  release:
+    needs: build-tauri
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: artifacts/**/*
+          draft: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
