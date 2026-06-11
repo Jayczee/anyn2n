@@ -19,7 +19,7 @@ bun run tauri dev     # 需要管理员权限
 bun run tauri build
 ```
 
-Edge 二进制和 `wintun.dll` 提前放入 `src-tauri/binaries/`，或使用 `build-edge.sh` 编译。
+Edge 二进制和 `wintun.dll` 提前放入 `src-tauri/binaries/`。
 
 ## Edge 二进制构建
 

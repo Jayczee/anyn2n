@@ -3,6 +3,16 @@ use crate::n2n::EdgeStatus;
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
+// 创建不弹 CMD 窗口的子进程
+fn hidden_cmd(name: &str) -> std::process::Command {
+    let mut c = std::process::Command::new(name);
+    #[cfg(target_os = "windows")]
+    {
+        std::os::windows::process::CommandExt::creation_flags(&mut c, 0x08000000); // CREATE_NO_WINDOW
+    }
+    c
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ConnectRequest {
     pub server_address: String,
@@ -161,20 +171,53 @@ pub async fn measure_server_rtt(ip: String, port: u16) -> Result<Option<u64>, St
 
 #[tauri::command]
 pub async fn ping_peer(ip: String) -> Result<Option<u64>, String> {
-    use std::process::Command;
-    #[cfg(target_os = "windows")]
-    let output = Command::new("ping").args(["-n", "1", "-w", "2000", &ip]).output();
-    #[cfg(not(target_os = "windows"))]
-    let output = Command::new("ping").args(["-c", "1", "-W", "2", &ip]).output();
+    log::debug!("Pinging peer: {}", ip);
 
-    let out = output.map_err(|e| handle_error(e))?;
+    #[cfg(target_os = "windows")]
+    let output = hidden_cmd("ping").args(["-n", "1", "-w", "2000", &ip]).output();
+    #[cfg(not(target_os = "windows"))]
+    let output = hidden_cmd("ping").args(["-c", "1", "-W", "2", &ip]).output();
+
+    let out = output.map_err(|e| {
+        log::error!("Ping command failed: {}", e);
+        handle_error(e)
+    })?;
+
+    if !out.status.success() {
+        log::warn!("Ping {} failed with exit code: {:?}", ip, out.status.code());
+        return Ok(None);
+    }
+
     let text = String::from_utf8_lossy(&out.stdout);
-    for part in text.split_whitespace() {
-        if part.starts_with("time") {
-            let num: String = part.chars().filter(|c| c.is_ascii_digit()).collect();
-            if let Ok(ms) = num.parse::<u64>() { return Ok(Some(ms)); }
+    log::debug!("Ping {} output: {}", ip, text);
+
+    // 通用策略：查找所有形如 "数字ms" 或 "数字 ms" 的模式
+    // 匹配 TTL= 之后第一个出现的延迟值（所有系统都有 TTL 字段）
+    if let Some(ttl_pos) = text.to_uppercase().find("TTL") {
+        let before_ttl = &text[..ttl_pos];
+        // 从 TTL 之前倒序查找最后一个数字+ms组合
+        let words: Vec<&str> = before_ttl.split_whitespace().rev().collect();
+        for word in words.iter().take(5) {  // 只看 TTL 前面 5 个词
+            let lower = word.to_lowercase();
+            if lower.contains("ms") || lower.ends_with("ms") {
+                // 提取这个词中的所有数字
+                let num_str: String = word.chars().filter(|c| c.is_ascii_digit()).collect();
+                if !num_str.is_empty() {
+                    if let Ok(ms) = num_str.parse::<u64>() {
+                        log::debug!("Parsed RTT for {}: {}ms", ip, ms);
+                        return Ok(Some(ms));
+                    }
+                }
+            }
+            // 处理 <1ms 或 < 1ms
+            if word.contains('<') {
+                log::debug!("Parsed RTT for {}: <1ms (returning 0)", ip);
+                return Ok(Some(0));
+            }
         }
     }
+
+    log::warn!("Could not parse RTT from ping output for {}", ip);
     Ok(None)
 }
 
@@ -333,25 +376,25 @@ pub async fn check_firewall_status() -> Result<FirewallStatus, String> {
     let _prog = edge_path();
     #[cfg(target_os = "windows")]
     {
-        let out = Command::new("netsh").args(["advfirewall", "show", "allprofiles", "state"]).output();
+        let out = hidden_cmd("netsh").args(["advfirewall", "show", "allprofiles", "state"]).output();
         let enabled = out.map_or(false, |o| String::from_utf8_lossy(&o.stdout).contains("ON"));
-        let out2 = Command::new("netsh").args(["advfirewall", "firewall", "show", "rule", "name=AnyN2N Edge"]).output();
+        let out2 = hidden_cmd("netsh").args(["advfirewall", "firewall", "show", "rule", "name=AnyN2N Edge"]).output();
         let rule_exists = out2.map_or(false, |o| String::from_utf8_lossy(&o.stdout).contains("AnyN2N Edge"));
         Ok(FirewallStatus { enabled, rule_exists, platform: "windows".into() })
     }
     #[cfg(target_os = "macos")]
     {
         let fw = "/usr/libexec/ApplicationFirewall/socketfilterfw";
-        let out = Command::new(fw).args(["--getglobalstate"]).output();
+        let out = hidden_cmd(fw).args(["--getglobalstate"]).output();
         let enabled = out.map_or(false, |o| String::from_utf8_lossy(&o.stdout).contains("on"));
-        let out2 = Command::new(fw).args(["--listapps"]).output();
+        let out2 = hidden_cmd(fw).args(["--listapps"]).output();
         let rule_exists = out2.map_or(false, |o| String::from_utf8_lossy(&o.stdout).contains(&_prog));
         Ok(FirewallStatus { enabled, rule_exists, platform: "macos".into() })
     }
     #[cfg(target_os = "linux")]
     {
-        let enabled = Command::new("firewall-cmd").arg("--state").output().map_or(false, |o| o.status.success())
-            || Command::new("ufw").arg("status").output().map_or(false, |o| String::from_utf8_lossy(&o.stdout).contains("active"));
+        let enabled = hidden_cmd("firewall-cmd").arg("--state").output().map_or(false, |o| o.status.success())
+            || hidden_cmd("ufw").arg("status").output().map_or(false, |o| String::from_utf8_lossy(&o.stdout).contains("active"));
         let rule_exists = false; // Linux 不易可靠检查已有规则
         Ok(FirewallStatus { enabled, rule_exists, platform: "linux".into() })
     }
@@ -363,25 +406,25 @@ pub async fn add_firewall_rule() -> Result<String, String> {
     let prog = edge_path();
     #[cfg(target_os = "windows")]
     {
-        let out = Command::new("netsh").args(["advfirewall", "firewall", "add", "rule", "name=AnyN2N Edge", "dir=in", "action=allow", &format!("program={}", prog), "enable=yes"]).output().map_err(|e| e.to_string())?;
+        let out = hidden_cmd("netsh").args(["advfirewall", "firewall", "add", "rule", "name=AnyN2N Edge", "dir=in", "action=allow", &format!("program={}", prog), "enable=yes"]).output().map_err(|e| e.to_string())?;
         if out.status.success() { Ok("已添加防火墙规则，放行 AnyN2N Edge 程序".into()) }
         else { Err(format!("{}", String::from_utf8_lossy(&out.stderr))) }
     }
     #[cfg(target_os = "macos")]
     {
         let fw = "/usr/libexec/ApplicationFirewall/socketfilterfw";
-        Command::new(fw).arg("--add").arg(&prog).output().map_err(|e| e.to_string())?;
-        Command::new(fw).arg("--unblockapp").arg(&prog).output().map_err(|e| e.to_string())?;
+        hidden_cmd(fw).arg("--add").arg(&prog).output().map_err(|e| e.to_string())?;
+        hidden_cmd(fw).arg("--unblockapp").arg(&prog).output().map_err(|e| e.to_string())?;
         Ok("已为 AnyN2N Edge 添加 macOS 防火墙例外".into())
     }
     #[cfg(target_os = "linux")]
     {
-        let has_fw = Command::new("firewall-cmd").arg("--state").output().map_or(false, |o| o.status.success());
+        let has_fw = hidden_cmd("firewall-cmd").arg("--state").output().map_or(false, |o| o.status.success());
         if has_fw {
-            Command::new("sh").args(["-c", "firewall-cmd --permanent --direct --add-rule ipv4 filter INPUT 0 -j ACCEPT -p udp && firewall-cmd --reload"]).output().map_err(|e| e.to_string())?;
+            hidden_cmd("sh").args(["-c", "firewall-cmd --permanent --direct --add-rule ipv4 filter INPUT 0 -j ACCEPT -p udp && firewall-cmd --reload"]).output().map_err(|e| e.to_string())?;
         } else {
             let uid = std::process::id().to_string();
-            Command::new("sh").args(["-c", &format!("iptables -I INPUT -p udp -j ACCEPT -m comment --comment 'AnyN2N Edge' 2>/dev/null; iptables -I INPUT -p tcp -j ACCEPT -m comment --comment 'AnyN2N Edge' 2>/dev/null")]).output().map_err(|e| e.to_string())?;
+            hidden_cmd("sh").args(["-c", &format!("iptables -I INPUT -p udp -j ACCEPT -m comment --comment 'AnyN2N Edge' 2>/dev/null; iptables -I INPUT -p tcp -j ACCEPT -m comment --comment 'AnyN2N Edge' 2>/dev/null")]).output().map_err(|e| e.to_string())?;
         }
         Ok("已添加 Linux 防火墙规则".into())
     }
@@ -392,20 +435,20 @@ pub async fn disable_firewall() -> Result<String, String> {
     use std::process::Command;
     #[cfg(target_os = "windows")]
     {
-        Command::new("netsh").args(["advfirewall", "set", "allprofiles", "state", "off"]).output().map_err(|e| e.to_string())?;
+        hidden_cmd("netsh").args(["advfirewall", "set", "allprofiles", "state", "off"]).output().map_err(|e| e.to_string())?;
         Ok("已关闭 Windows Defender 防火墙".into())
     }
     #[cfg(target_os = "macos")]
     {
-        Command::new("/usr/libexec/ApplicationFirewall/socketfilterfw").args(["--setglobalstate", "off"]).output().map_err(|e| e.to_string())?;
+        hidden_cmd("/usr/libexec/ApplicationFirewall/socketfilterfw").args(["--setglobalstate", "off"]).output().map_err(|e| e.to_string())?;
         Ok("已关闭 macOS 防火墙".into())
     }
     #[cfg(target_os = "linux")]
     {
-        if Command::new("firewall-cmd").arg("--state").output().map_or(false, |o| o.status.success()) {
-            Command::new("sh").args(["-c", "systemctl stop firewalld; systemctl disable firewalld"]).output().map_err(|e| e.to_string())?;
+        if hidden_cmd("firewall-cmd").arg("--state").output().map_or(false, |o| o.status.success()) {
+            hidden_cmd("sh").args(["-c", "systemctl stop firewalld; systemctl disable firewalld"]).output().map_err(|e| e.to_string())?;
         } else {
-            Command::new("sh").args(["-c", "ufw disable"]).output().map_err(|e| e.to_string())?;
+            hidden_cmd("sh").args(["-c", "ufw disable"]).output().map_err(|e| e.to_string())?;
         }
         Ok("已关闭 Linux 防火墙".into())
     }

@@ -4472,6 +4472,7 @@ dependencies = [
  "image",
  "ipconfig",
  "log",
+ "once_cell",
  "rand 0.8.6",
  "serde",
  "serde_json",

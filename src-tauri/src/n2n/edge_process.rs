@@ -1,7 +1,18 @@
 use anyhow::Result;
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// 创建不弹 CMD 窗口的子进程（Windows: CREATE_NO_WINDOW）
+fn hidden_cmd(name: &str) -> Command {
+    let mut c = Command::new(name);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    c
+}
 
 /// Edge 进程管理器
 pub struct EdgeProcessManager {
@@ -103,7 +114,7 @@ impl EdgeProcessManager {
 
     #[cfg(target_os = "windows")]
     async fn start_windows(&self, args: Vec<String>) -> Result<()> {
-        use std::process::Command;
+        use std::os::windows::process::CommandExt;
 
         let sidecar_path = if cfg!(debug_assertions) {
             std::env::current_dir()?
@@ -112,17 +123,19 @@ impl EdgeProcessManager {
                 .to_string_lossy()
                 .to_string()
         } else {
-            "edge-x86_64-pc-windows-msvc.exe".to_string()
+            // 发布模式下 Tauri 会将 externalBin 改名为 edge.exe
+            "edge.exe".to_string()
         };
 
         log::info!("Sidecar path: {}", sidecar_path);
         log::info!("Edge args: {:?}", args);
 
-        // 直接启动 edge（应用自身已有管理员权限）
+        // 直接启动 edge（应用自身已有管理员权限），CREATE_NO_WINDOW 防止弹出 CMD 窗口
         let mut child = Command::new(&sidecar_path)
             .args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
             .spawn()?;
 
         // 读取 edge 输出，实时跟踪连接状态
@@ -157,11 +170,10 @@ impl EdgeProcessManager {
 
     /// 强制终止所有 edge 进程
     pub async fn kill_all_edges(&self) -> Result<()> {
-        use std::process::Command;
-        let _ = Command::new("taskkill")
+        let _ = hidden_cmd("taskkill")
             .args(&["/F", "/IM", "edge-x86_64-pc-windows-msvc.exe"])
             .output();
-        let _ = Command::new("taskkill")
+        let _ = hidden_cmd("taskkill")
             .args(&["/F", "/IM", "edge.exe"])
             .output();
         Ok(())
@@ -292,11 +304,21 @@ fn parse_edge_output(
     let buf = std::io::BufReader::new(reader);
     for line in buf.lines() {
         if let Ok(line) = line {
-            log::info!("[edge] {}", line);
-            // 存入日志 buffer，供前端窗口读取（blocking 因为在 std thread 中）
-            if logs.blocking_read().len() < 2000 {
-                logs.blocking_write().push(line.clone());
+            // 过滤掉高频的数据包传输日志
+            if line.contains("Tx PACKET") || line.contains("Rx PACKET") {
+                continue;
             }
+
+            // 打印到 dev 控制台
+            log::info!("[edge] {}", line);
+
+            // 存入日志 buffer，带完整格式（时间戳 + 模块 + 级别 + 内容）
+            if logs.blocking_read().len() < 2000 {
+                let timestamp = chrono::Local::now().format("[%Y-%m-%d][%H:%M:%S]");
+                let formatted = format!("{}[tauri_native_lib::n2n::edge_process][INFO] [edge] {}", timestamp, line);
+                logs.blocking_write().push(formatted);
+            }
+
             let now = || SystemTime::now().duration_since(UNIX_EPOCH).map(|t| t.as_secs()).unwrap_or(0);
 
             // TUN 设备就绪 + 提取分配的 IP
@@ -349,8 +371,7 @@ fn extract_ip_after_colon(line: &str, prefix: &str) -> Option<String> {
 /// 获取本机所有 IPv4 地址列表
 #[cfg(target_os = "windows")]
 fn get_all_local_ips() -> Vec<String> {
-    use std::process::Command;
-    let output = Command::new("powershell")
+    let output = hidden_cmd("powershell")
         .args([
             "-NoProfile",
             "-Command",

@@ -4,10 +4,23 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use std::time::Instant;
 
+/// 全局日志 buffer，供所有模块写入
+static GLOBAL_LOGS: once_cell::sync::Lazy<Arc<RwLock<Vec<String>>>> =
+    once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(Vec::new())));
+
+/// 添加日志到全局 buffer（供其他模块调用）
+pub async fn add_global_log(level: &str, module: &str, message: String) {
+    let mut logs = GLOBAL_LOGS.write().await;
+    if logs.len() < 5000 {
+        let timestamp = chrono::Local::now().format("[%Y-%m-%d][%H:%M:%S]");
+        let log_msg = format!("{}[{}][{}] {}", timestamp, module, level, message);
+        logs.push(log_msg);
+    }
+}
+
 /// 全局连接管理器
 pub struct ConnectionManager {
     edge_process: Arc<EdgeProcessManager>,
-    logs: Arc<RwLock<Vec<String>>>,
     status: Arc<RwLock<Option<EdgeStatus>>>,
     last_query: Arc<RwLock<Instant>>,
     connect_gen: Arc<RwLock<u64>>, // 连接代际，cancel/reconnect 时递增
@@ -17,7 +30,6 @@ impl ConnectionManager {
     pub fn new() -> Self {
         Self {
             edge_process: Arc::new(EdgeProcessManager::new()),
-            logs: Arc::new(RwLock::new(Vec::new())),
             status: Arc::new(RwLock::new(None)),
             last_query: Arc::new(RwLock::new(Instant::now())),
             connect_gen: Arc::new(RwLock::new(0)),
@@ -26,18 +38,15 @@ impl ConnectionManager {
 
     /// 添加日志
     pub async fn add_log(&self, message: String) {
-        let timestamp = chrono::Local::now().format("%H:%M:%S");
-        let log_msg = format!("[{}] {}", timestamp, message);
         log::info!("{}", message);
-        self.logs.write().await.push(log_msg);
+        add_global_log("INFO", "tauri_native_lib::manager", message).await;
     }
 
-    /// 获取所有日志（合并 manager 日志 + edge 进程输出）
+    /// 获取所有日志（合并全局日志 + edge 进程输出）
     pub async fn get_logs(&self) -> Vec<String> {
-        let mut all = self.logs.read().await.clone();
+        let mut all = GLOBAL_LOGS.read().await.clone();
         let edge_logs = self.edge_process.logs.read().await.clone();
         all.extend(edge_logs);
-        // 按时间粗略排序（manager 日志有 [HH:MM:SS] 前缀，edge 有日期前缀）
         all
     }
 
