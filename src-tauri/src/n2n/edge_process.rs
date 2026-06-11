@@ -1,9 +1,12 @@
 use anyhow::Result;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
 
 /// 创建不弹 CMD 窗口的子进程（Windows: CREATE_NO_WINDOW）
+#[cfg(any(windows, target_os = "linux"))]
 fn hidden_cmd(name: &str) -> Command {
     let mut c = Command::new(name);
     #[cfg(target_os = "windows")]
@@ -93,10 +96,16 @@ impl EdgeProcessManager {
             self.start_windows(args).await?;
         }
 
-        // macOS/Linux 使用 sudo
-        #[cfg(not(target_os = "windows"))]
+        // macOS：utun 不需要 root
+        #[cfg(target_os = "macos")]
         {
-            self.start_unix_sudo(args).await?;
+            self.start_macos(args).await?;
+        }
+
+        // Linux：TUN 设备需要 root/CAP_NET_ADMIN
+        #[cfg(target_os = "linux")]
+        {
+            self.start_linux(args).await?;
         }
 
         *self.active.write().await = true;
@@ -161,51 +170,118 @@ impl EdgeProcessManager {
 
     /// 强制终止所有 edge 进程
     pub async fn kill_all_edges(&self) -> Result<()> {
-        let _ = hidden_cmd("taskkill")
-            .args(&["/F", "/IM", "edge-x86_64-pc-windows-msvc.exe"])
-            .output();
-        let _ = hidden_cmd("taskkill")
-            .args(&["/F", "/IM", "edge.exe"])
-            .output();
+        #[cfg(target_os = "windows")]
+        {
+            let _ = hidden_cmd("taskkill")
+                .args(&["/F", "/IM", "edge-x86_64-pc-windows-msvc.exe"])
+                .output();
+            let _ = hidden_cmd("taskkill")
+                .args(&["/F", "/IM", "edge.exe"])
+                .output();
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            // pkill on macOS/Linux — best-effort
+            let _ = std::process::Command::new("pkill")
+                .args(["-f", "edge-"])
+                .output();
+        }
         Ok(())
     }
 
-    #[cfg(not(target_os = "windows"))]
-    async fn start_unix_sudo(&self, args: Vec<String>) -> Result<()> {
-        use std::process::Command;
-
-        // Tauri 2.0 sidecar 路径
-        let sidecar_path = if cfg!(debug_assertions) {
-            // 开发模式
-            std::env::current_dir()?
-                .join("binaries")
-                .join(if cfg!(target_os = "macos") {
-                    if cfg!(target_arch = "aarch64") {
-                        "edge-aarch64-apple-darwin"
-                    } else {
-                        "edge-x86_64-apple-darwin"
-                    }
-                } else {
-                    "edge-x86_64-unknown-linux-gnu"
-                })
-                .to_string_lossy()
-                .to_string()
-        } else {
-            // 发布模式
-            "edge".to_string()
-        };
+    /// macOS：使用 osascript do shell script 管理员权限启动 edge（原生用户名+密码弹窗）
+    #[cfg(target_os = "macos")]
+    async fn start_macos(&self, args: Vec<String>) -> Result<()> {
+        let sidecar_path = resolve_unix_sidecar("edge-aarch64-apple-darwin", "edge-x86_64-apple-darwin")?;
 
         log::info!("Sidecar path: {}", sidecar_path);
 
-        // 使用 sudo 启动
+        // 创建临时日志文件（edge 输出重定向到此）
+        let log_dir = std::env::temp_dir().join("anyn2n");
+        std::fs::create_dir_all(&log_dir)?;
+        let log_path = log_dir.join(format!("edge-{}.log", self.management_port));
+        let _ = std::fs::remove_file(&log_path);
+
+        let log_file = log_path.to_string_lossy().replace('\'', "'\\''");
+
+        // 构建 shell 命令：后台启动 edge，输出重定向到日志文件
+        // 不使用 nohup（在 osascript do shell script 上下文中会报 ioctl 错误）
+        let cmd = format!(
+            "'{}' {} > '{}' 2>&1 &",
+            sidecar_path.replace('\'', "'\\''"),
+            args.join(" "),
+            log_file
+        );
+
+        // do shell script with administrator privileges 弹出标准 macOS 授权对话框
+        // 显示用户名+密码（支持 Touch ID），后台 & 使其立即返回
+        let script = format!(
+            "do shell script \"{}\" with administrator privileges",
+            cmd.replace("\"", "\\\"")
+        );
+
+        log::info!("Launching edge via osascript admin dialog...");
+
+        let osa_output = Command::new("osascript")
+            .args(["-e", &script])
+            .output()?;
+
+        if !osa_output.status.success() {
+            let err = String::from_utf8_lossy(&osa_output.stderr);
+            let out = String::from_utf8_lossy(&osa_output.stdout);
+            if err.contains("User canceled") || err.is_empty() && out.is_empty() {
+                return Err(anyhow::anyhow!("用户取消了管理员授权"));
+            }
+            return Err(anyhow::anyhow!("授权失败: {}", err.trim()));
+        }
+
+        log::info!("Edge launched with admin privileges, log: {}", log_path.display());
+
+        // 读取日志文件，实时跟踪连接状态
+        let sn = self.last_sn_contact.clone();
+        let tun = self.tun_ready.clone();
+        let sn_ok = self.sn_connected.clone();
+        let ip = self.local_ip.clone();
+        let log_lines = self.logs.clone();
+
+        std::thread::spawn(move || {
+            // 等待日志文件被 edge 创建
+            for _ in 0..30 {
+                if log_path.exists() { break; }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            if let Ok(file) = std::fs::File::open(&log_path) {
+                parse_edge_output(file, sn, tun, sn_ok, ip, log_lines);
+            }
+        });
+
+        // edge 通过 & 后台运行，没有直接子进程句柄
+        // 停止通过 stop_via_management() UDP 命令
+        *self.child.write().await = None;
+
+        Ok(())
+    }
+
+    /// Linux：TUN 设备需要 root 权限，通过 sudo 启动
+    #[cfg(target_os = "linux")]
+    async fn start_linux(&self, args: Vec<String>) -> Result<()> {
+        use std::process::Command;
+
+        let sidecar_path = resolve_unix_sidecar("edge-x86_64-unknown-linux-gnu", "edge-x86_64-unknown-linux-gnu")?;
+
+        log::info!("Sidecar path: {}", sidecar_path);
+
         let mut sudo_args = vec![sidecar_path];
         sudo_args.extend(args);
 
-        let child = Command::new("sudo")
+        let mut child = Command::new("sudo")
             .args(&sudo_args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
+
+        // 读取 edge 输出，实时跟踪连接状态
+        spawn_output_readers(&mut child, &self.last_sn_contact, &self.tun_ready, &self.sn_connected, &self.local_ip, &self.logs);
 
         *self.child.write().await = Some(child);
 
@@ -281,6 +357,54 @@ impl Default for EdgeProcessManager {
     }
 }
 
+/// 解析 Unix（macOS/Linux）sidecar 路径
+#[cfg(not(target_os = "windows"))]
+fn resolve_unix_sidecar(aarch64_name: &str, x86_64_name: &str) -> Result<String> {
+    if cfg!(debug_assertions) {
+        let binary_name = if cfg!(target_arch = "aarch64") {
+            aarch64_name
+        } else {
+            x86_64_name
+        };
+        Ok(std::env::current_dir()?
+            .join("binaries")
+            .join(binary_name)
+            .to_string_lossy()
+            .to_string())
+    } else {
+        Ok("edge".to_string())
+    }
+}
+
+/// 为子进程启动 stdout/stderr 读取线程
+#[cfg(not(target_os = "windows"))]
+fn spawn_output_readers(
+    child: &mut std::process::Child,
+    last_sn: &Arc<RwLock<u64>>,
+    tun_ready: &Arc<RwLock<bool>>,
+    sn_connected: &Arc<RwLock<bool>>,
+    local_ip: &Arc<RwLock<String>>,
+    logs: &Arc<RwLock<Vec<String>>>,
+) {
+    let sn = last_sn.clone();
+    let tun = tun_ready.clone();
+    let sn_ok = sn_connected.clone();
+    let ip = local_ip.clone();
+    let log_lines = logs.clone();
+
+    if let Some(stderr) = child.stderr.take() {
+        let (sn, tun, sn_ok, ip, log_lines) = (sn.clone(), tun.clone(), sn_ok.clone(), ip.clone(), log_lines.clone());
+        std::thread::spawn(move || {
+            parse_edge_output(stderr, sn, tun, sn_ok, ip, log_lines);
+        });
+    }
+    if let Some(stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            parse_edge_output(stdout, sn, tun, sn_ok, ip, log_lines);
+        });
+    }
+}
+
 /// 解析 edge 进程输出，实时更新连接状态
 fn parse_edge_output(
     reader: impl std::io::Read + Send + 'static,
@@ -306,7 +430,7 @@ fn parse_edge_output(
             // 存入日志 buffer，带完整格式（时间戳 + 模块 + 级别 + 内容）
             if logs.blocking_read().len() < 2000 {
                 let timestamp = chrono::Local::now().format("[%Y-%m-%d][%H:%M:%S]");
-                let formatted = format!("{}[tauri_native_lib::n2n::edge_process][INFO] [edge] {}", timestamp, line);
+                let formatted = format!("{}[anyn2n_lib::n2n::edge_process][INFO] [edge] {}", timestamp, line);
                 logs.blocking_write().push(formatted);
             }
 

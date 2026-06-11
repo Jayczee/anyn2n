@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "anyn2n",
+  "productName": "AnyN2N",
   "version": "1.0.0",
   "identifier": "cn.jayczee.anyn2n",
   "build": {

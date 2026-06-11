@@ -77,12 +77,12 @@ impl EdgeManagementClient {
         // 先获取 summary (r 命令)
         let summary = self.send_cmd("r\n")?;
         log::debug!("Summary: {}", summary);
-        let _ = log_to_buffer("DEBUG", "tauri_native_lib::n2n::management", format!("Summary: {}", summary));
+        let _ = log_to_buffer("DEBUG", "anyn2n_lib::n2n::management", format!("Summary: {}", summary));
 
         // 再获取 edges 表格
         let edges_raw = self.send_cmd("edges\n")?;
         log::debug!("Edges: {}", edges_raw);
-        let _ = log_to_buffer("DEBUG", "tauri_native_lib::n2n::management", format!("Edges: {}", edges_raw));
+        let _ = log_to_buffer("DEBUG", "anyn2n_lib::n2n::management", format!("Edges: {}", edges_raw));
 
         self.parse(&summary, &edges_raw)
     }
@@ -165,11 +165,11 @@ impl EdgeManagementClient {
         // 获取 ARP 表，只保留与本地 VPN 子网匹配的条目
         let arp_table = if let Some(ref subnet) = local_vpn_subnet {
             log::debug!("Detected VPN subnet: {}.x", subnet);
-            let _ = log_to_buffer("DEBUG", "tauri_native_lib::n2n::management", format!("Detected VPN subnet: {}.x", subnet));
+            let _ = log_to_buffer("DEBUG", "anyn2n_lib::n2n::management", format!("Detected VPN subnet: {}.x", subnet));
             get_arp_table_for_subnet(subnet)
         } else {
             log::warn!("Could not detect VPN subnet, ARP filtering disabled");
-            let _ = log_to_buffer("WARN", "tauri_native_lib::n2n::management", "Could not detect VPN subnet, ARP filtering disabled".to_string());
+            let _ = log_to_buffer("WARN", "anyn2n_lib::n2n::management", "Could not detect VPN subnet, ARP filtering disabled".to_string());
             HashMap::new()
         };
 
@@ -210,9 +210,9 @@ impl EdgeManagementClient {
             let edge = parts[3].trim();
 
             log::debug!("Parsing line: {}", line);
-            let _ = log_to_buffer("DEBUG", "tauri_native_lib::n2n::management", format!("Parsing line: {}", line));
+            let _ = log_to_buffer("DEBUG", "anyn2n_lib::n2n::management", format!("Parsing line: {}", line));
             log::debug!("  vpn_ip='{}', mac='{}', edge='{}'", vpn_ip, mac, edge);
-            let _ = log_to_buffer("DEBUG", "tauri_native_lib::n2n::management", format!("  vpn_ip='{}', mac='{}', edge='{}'", vpn_ip, mac, edge));
+            let _ = log_to_buffer("DEBUG", "anyn2n_lib::n2n::management", format!("  vpn_ip='{}', mac='{}', edge='{}'", vpn_ip, mac, edge));
 
             // 跳过内部条目
             if mac.is_empty() || mac == "MAC" || mac.starts_with("01:80") || mac.starts_with("01:00") { continue; }
@@ -231,7 +231,7 @@ impl EdgeManagementClient {
             if final_vpn_ip.is_empty() {
                 log::warn!("Skipping peer: mac='{}', no VPN IP found (original='{}', arp_table_size={})",
                            mac, vpn_ip, arp_table.len());
-                let _ = log_to_buffer("WARN", "tauri_native_lib::n2n::management",
+                let _ = log_to_buffer("WARN", "anyn2n_lib::n2n::management",
                     format!("Skipping peer: mac='{}', no VPN IP found (original='{}', arp_table_size={})", mac, vpn_ip, arp_table.len()));
                 continue;
             }
@@ -244,7 +244,7 @@ impl EdgeManagementClient {
             };
 
             log::debug!("  Found peer: ip='{}', mac='{}', type='{}'", final_vpn_ip, mac, conn_type);
-            let _ = log_to_buffer("DEBUG", "tauri_native_lib::n2n::management",
+            let _ = log_to_buffer("DEBUG", "anyn2n_lib::n2n::management",
                 format!("  Found peer: ip='{}', mac='{}', type='{}'", final_vpn_ip, mac, conn_type));
 
             status.peers.push(PeerInfo {
@@ -289,11 +289,11 @@ fn get_arp_table_for_subnet(subnet_prefix: &str) -> HashMap<String, String> {
     }
 
     log::debug!("ARP table (subnet {}): {} entries", subnet_prefix, map.len());
-    let _ = log_to_buffer("DEBUG", "tauri_native_lib::n2n::management",
+    let _ = log_to_buffer("DEBUG", "anyn2n_lib::n2n::management",
         format!("ARP table (subnet {}): {} entries", subnet_prefix, map.len()));
     for (mac, ip) in &map {
         log::debug!("  {} -> {}", mac, ip);
-        let _ = log_to_buffer("DEBUG", "tauri_native_lib::n2n::management", format!("  {} -> {}", mac, ip));
+        let _ = log_to_buffer("DEBUG", "anyn2n_lib::n2n::management", format!("  {} -> {}", mac, ip));
     }
 
     map

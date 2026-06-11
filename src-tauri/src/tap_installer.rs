@@ -1,6 +1,5 @@
 use anyhow::Result;
 
-#[cfg(windows)]
 pub fn check_tap_installed() -> bool {
     use std::process::Command;
     use std::os::windows::process::CommandExt;
@@ -19,12 +18,6 @@ pub fn check_tap_installed() -> bool {
     }
 }
 
-#[cfg(not(windows))]
-pub fn check_tap_installed() -> bool {
-    false
-}
-
-#[cfg(windows)]
 pub fn install_tap_driver() -> Result<()> {
     use std::process::Command;
     use std::os::windows::process::CommandExt;
@@ -52,12 +45,6 @@ pub fn install_tap_driver() -> Result<()> {
     }
 }
 
-#[cfg(not(windows))]
-pub fn install_tap_driver() -> Result<()> {
-    Err(anyhow::anyhow!("TAP driver only supported on Windows"))
-}
-
-#[cfg(windows)]
 pub fn show_install_error_dialog(detail: &str) {
     use std::process::Command;
     use std::os::windows::process::CommandExt;
@@ -78,6 +65,3 @@ pub fn show_install_error_dialog(detail: &str) {
         .creation_flags(0x08000000)
         .output();
 }
-
-#[cfg(not(windows))]
-pub fn show_install_error_dialog(_detail: &str) {}

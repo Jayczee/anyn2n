@@ -39,7 +39,7 @@ impl ConnectionManager {
     /// 添加日志
     pub async fn add_log(&self, message: String) {
         log::info!("{}", message);
-        add_global_log("INFO", "tauri_native_lib::manager", message).await;
+        add_global_log("INFO", "anyn2n_lib::manager", message).await;
     }
 
     /// 获取所有日志（合并全局日志 + edge 进程输出）
