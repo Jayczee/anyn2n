@@ -37,9 +37,6 @@
       "icons/icon.icns",
       "icons/frog_original.ico"
     ],
-    "externalBin": [
-      "binaries/edge"
-    ],
     "windows": {
       "nsis": {
         "installMode": "currentUser"

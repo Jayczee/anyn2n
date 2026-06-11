@@ -116,18 +116,9 @@ impl EdgeProcessManager {
     async fn start_windows(&self, args: Vec<String>) -> Result<()> {
         use std::os::windows::process::CommandExt;
 
-        let sidecar_path = if cfg!(debug_assertions) {
-            std::env::current_dir()?
-                .join("binaries")
-                .join("edge-x86_64-pc-windows-msvc.exe")
-                .to_string_lossy()
-                .to_string()
-        } else {
-            // 发布模式下 Tauri 会将 externalBin 改名为 edge.exe
-            "edge.exe".to_string()
-        };
+        let sidecar_path = crate::embedded::edge_path();
 
-        log::info!("Sidecar path: {}", sidecar_path);
+        log::info!("Sidecar path: {:?}", sidecar_path);
         log::info!("Edge args: {:?}", args);
 
         // 直接启动 edge（应用自身已有管理员权限），CREATE_NO_WINDOW 防止弹出 CMD 窗口

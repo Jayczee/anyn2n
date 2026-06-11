@@ -2,6 +2,8 @@ mod n2n;
 mod manager;
 mod commands;
 mod servers;
+mod tap_installer;
+mod embedded;
 
 use manager::ConnectionManager;
 use servers::ServerManager;
@@ -70,6 +72,21 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(external_navigation_plugin())
         .setup(|app| {
+            // 检查并安装 TAP 驱动
+            if !tap_installer::check_tap_installed() {
+                log::warn!("未检测到 TAP-Windows 虚拟网卡，尝试自动安装...");
+                match tap_installer::install_tap_driver() {
+                    Ok(()) => {
+                        log::info!("TAP 驱动安装成功");
+                    }
+                    Err(e) => {
+                        log::error!("TAP 驱动安装失败: {}", e);
+                        tap_installer::show_install_error_dialog(&e.to_string());
+                        std::process::exit(1);
+                    }
+                }
+            }
+
             // 设置主窗口图标为绿色青蛙
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.set_icon(ico_to_image(ICON_GREEN_BYTES));

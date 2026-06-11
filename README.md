@@ -19,6 +19,8 @@ bun run tauri dev     # 需要管理员权限
 bun run tauri build
 ```
 
+Windows可以运行build-portable.ps1来构建portable单文件版本。
+
 Edge 二进制和 `wintun.dll` 提前放入 `src-tauri/binaries/`。
 
 ## Edge 二进制构建

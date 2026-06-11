@@ -17,12 +17,7 @@ if (Test-Path "dist-portable") {
 New-Item -ItemType Directory -Path $portableDir -Force | Out-Null
 
 Copy-Item "src-tauri\target\release\tauri-native.exe" "$portableDir\anyn2n.exe" -Force
-Copy-Item "src-tauri\binaries\edge-x86_64-pc-windows-msvc.exe" "$portableDir\edge.exe" -Force
-Copy-Item "src-tauri\binaries\wintun.dll" "$portableDir\wintun.dll" -Force
 
-Write-Host ""
-Write-Host "✓ Portable package created: $portableDir"
-Get-ChildItem $portableDir | ForEach-Object {
-    $size = "{0:N2} MB" -f ($_.Length/1MB)
-    Write-Host "  - $($_.Name) ($size)"
-}
+$size = "{0:N2} MB" -f ((Get-Item "$portableDir\anyn2n.exe").Length / 1MB)
+Write-Host "✓ Portable package: anyn2n.exe ($size)"
+Write-Host "  (edge.exe + tap-installer.exe 已嵌入)"
