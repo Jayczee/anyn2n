@@ -1,5 +1,5 @@
 use crate::manager::ConnectionManager;
-use crate::n2n::EdgeStatus;
+use crate::n2n::{EdgeManagementClient, EdgeStatus};
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
@@ -332,6 +332,7 @@ fn nets_lock() -> &'static std::sync::Mutex<sysinfo::Networks> {
 
 #[tauri::command]
 pub async fn get_tap_stats() -> Result<TapStats, String> {
+    // 优先使用 sysinfo 读取真实网卡统计
     let mut nets = nets_lock().lock().unwrap();
     nets.refresh(false);
 
@@ -346,6 +347,19 @@ pub async fn get_tap_stats() -> Result<TapStats, String> {
             });
         }
     }
+
+    // sysinfo 找不到网卡（userspace-networking 模式），尝试读管理端口
+    if let Ok(client) = EdgeManagementClient::new(5644) {
+        if let Ok(status) = client.query_status(&"".to_string()) {
+            return Ok(TapStats {
+                rx_bytes: 0,
+                tx_bytes: 0,
+                rx_packets: status.rx_packets,
+                tx_packets: status.tx_packets,
+            });
+        }
+    }
+
     Ok(TapStats { rx_bytes: 0, tx_bytes: 0, rx_packets: 0, tx_packets: 0 })
 }
 

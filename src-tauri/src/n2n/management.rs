@@ -328,6 +328,15 @@ impl EdgeManagementClient {
                 _ => "relay",
             };
 
+            // 每次从edges表解析peer时，立即更新持久化连接类型
+            {
+                let normalized_mac = mac.to_lowercase().replace('-', ":");
+                PERSISTENT_ARP.lock().unwrap().mac_to_conn_type.insert(
+                    normalized_mac,
+                    conn_type.to_string()
+                );
+            }
+
             log::debug!("  Found peer: ip='{}', mac='{}', type='{}'", final_vpn_ip, mac, conn_type);
             let _ = log_to_buffer("DEBUG", "anyn2n_lib::n2n::management",
                 format!("  Found peer: ip='{}', mac='{}', type='{}'", final_vpn_ip, mac, conn_type));
