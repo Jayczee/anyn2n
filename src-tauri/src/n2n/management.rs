@@ -4,6 +4,81 @@ use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::process::Command;
 use std::time::Duration;
+use std::sync::Mutex;
+use once_cell::sync::Lazy;
+
+// 持久化ARP表：MAC -> IP 和 IP -> MAC 双向映射
+pub static PERSISTENT_ARP: Lazy<Mutex<PersistentArp>> = Lazy::new(|| {
+    Mutex::new(PersistentArp {
+        mac_to_ip: HashMap::new(),
+        ip_to_mac: HashMap::new(),
+        mac_to_conn_type: HashMap::new(),
+    })
+});
+
+pub struct PersistentArp {
+    pub mac_to_ip: HashMap<String, String>,
+    pub ip_to_mac: HashMap<String, String>,
+    pub mac_to_conn_type: HashMap<String, String>, // MAC -> "p2p" | "relay"
+}
+
+impl PersistentArp {
+    fn update(&mut self, mac: String, ip: String) {
+        // 如果MAC已存在但IP不同，删除旧IP的反向映射
+        if let Some(old_ip) = self.mac_to_ip.get(&mac) {
+            if old_ip != &ip {
+                self.ip_to_mac.remove(old_ip);
+            }
+        }
+        // 如果IP已存在但MAC不同，删除旧MAC的正向映射
+        if let Some(old_mac) = self.ip_to_mac.get(&ip) {
+            if old_mac != &mac {
+                self.mac_to_ip.remove(old_mac);
+            }
+        }
+        self.mac_to_ip.insert(mac.clone(), ip.clone());
+        self.ip_to_mac.insert(ip, mac);
+    }
+
+    fn get_ip_by_mac(&self, mac: &str) -> Option<String> {
+        self.mac_to_ip.get(mac).cloned()
+    }
+
+    /// 从edge日志行更新连接类型（供 parse_edge_output 调用）
+    pub fn update_conn_type_from_edge_line(mac: String, is_p2p: bool) {
+        let conn_type = if is_p2p { "p2p" } else { "relay" };
+        PERSISTENT_ARP.lock().unwrap().mac_to_conn_type.insert(mac, conn_type.to_string());
+    }
+
+    /// 获取MAC对应的连接类型
+    fn get_conn_type(&self, mac: &str) -> Option<String> {
+        self.mac_to_conn_type.get(mac).cloned()
+    }
+}
+
+/// 从edge日志行提取MAC并更新连接类型到持久化表
+/// 格式: "[p2p] Rx REGISTER from XX:XX:XX:XX:XX:XX [...]" → p2p
+///       "[pSp] Rx REGISTER from XX:XX:XX:XX:XX:XX [...]" → relay
+pub fn update_conn_type_from_edge_log(line: &str) {
+    let mac = extract_mac_after_from(line);
+    if let Some(mac) = mac {
+        let is_p2p = line.contains("[p2p]");
+        PersistentArp::update_conn_type_from_edge_line(mac, is_p2p);
+    }
+}
+
+/// 从 "from XX:XX:XX:XX:XX:XX" 中提取MAC地址
+fn extract_mac_after_from(line: &str) -> Option<String> {
+    let pos = line.find("from ")?;
+    let after = &line[pos + 5..];
+    let mac = after.split_whitespace().next()?;
+    // 验证MAC格式: xx:xx:xx:xx:xx:xx
+    if mac.len() >= 17 && mac.chars().filter(|&c| c == ':').count() == 5 {
+        Some(mac.to_string())
+    } else {
+        None
+    }
+}
 
 /// 创建不弹 CMD 窗口的子进程（Windows: CREATE_NO_WINDOW）
 fn hidden_cmd(name: &str) -> Command {
@@ -68,12 +143,12 @@ impl EdgeManagementClient {
 
     fn send_cmd(&self, cmd: &str) -> Result<String> {
         self.socket.send_to(cmd.as_bytes(), self.management_addr)?;
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; 32768]; // 增大到32KB，避免截断
         let (len, _) = self.socket.recv_from(&mut buf)?;
         Ok(String::from_utf8_lossy(&buf[..len]).to_string())
     }
 
-    pub fn query_status(&self) -> Result<EdgeStatus> {
+    pub fn query_status(&self, local_ip: &str) -> Result<EdgeStatus> {
         // 先获取 summary (r 命令)
         let summary = self.send_cmd("r\n")?;
         log::debug!("Summary: {}", summary);
@@ -81,13 +156,14 @@ impl EdgeManagementClient {
 
         // 再获取 edges 表格
         let edges_raw = self.send_cmd("edges\n")?;
+        log::info!("Edges response length: {} bytes", edges_raw.len());
         log::debug!("Edges: {}", edges_raw);
         let _ = log_to_buffer("DEBUG", "anyn2n_lib::n2n::management", format!("Edges: {}", edges_raw));
 
-        self.parse(&summary, &edges_raw)
+        self.parse(&summary, &edges_raw, local_ip)
     }
 
-    fn parse(&self, summary: &str, edges_raw: &str) -> Result<EdgeStatus> {
+    fn parse(&self, summary: &str, edges_raw: &str, local_ip: &str) -> Result<EdgeStatus> {
         let mut status = EdgeStatus {
             is_running: true,
             uptime: 0,
@@ -159,11 +235,17 @@ impl EdgeManagementClient {
             }
         }
 
-        // 如果没找到，尝试从 summary 或其他地方获取
-        // (目前先用这个逻辑)
+        // fallback: 从本地IP推断子网
+        let vpn_subnet = local_vpn_subnet.or_else(|| {
+            if !local_ip.is_empty() && is_valid_ip(local_ip) {
+                Some(extract_subnet_prefix(local_ip))
+            } else {
+                None
+            }
+        });
 
         // 获取 ARP 表，只保留与本地 VPN 子网匹配的条目
-        let arp_table = if let Some(ref subnet) = local_vpn_subnet {
+        let arp_table = if let Some(ref subnet) = vpn_subnet {
             log::debug!("Detected VPN subnet: {}.x", subnet);
             let _ = log_to_buffer("DEBUG", "anyn2n_lib::n2n::management", format!("Detected VPN subnet: {}.x", subnet));
             get_arp_table_for_subnet(subnet)
@@ -218,23 +300,26 @@ impl EdgeManagementClient {
             if mac.is_empty() || mac == "MAC" || mac.starts_with("01:80") || mac.starts_with("01:00") { continue; }
             if edge.is_empty() || edge == "0.0.0.0:0" { continue; }
 
-            // 如果 VPN IP 为空，尝试从 ARP 表查找
-            let final_vpn_ip = if vpn_ip.is_empty() {
-                // 规范化 MAC 地址格式用于查找 (统一为冒号分隔小写)
+            // 确定VPN IP
+            let final_vpn_ip = if !vpn_ip.is_empty() {
+                // 有VPN IP，更新持久化ARP表
                 let normalized_mac = mac.to_lowercase().replace('-', ":");
-                arp_table.get(&normalized_mac).cloned().unwrap_or_default()
-            } else {
+                PERSISTENT_ARP.lock().unwrap().update(normalized_mac, vpn_ip.to_string());
                 vpn_ip.to_string()
+            } else {
+                // VPN IP为空，尝试从持久化ARP表查找
+                let normalized_mac = mac.to_lowercase().replace('-', ":");
+                PERSISTENT_ARP.lock().unwrap().get_ip_by_mac(&normalized_mac).unwrap_or_else(|| {
+                    // 持久化表也没有，尝试从系统ARP表查找并更新持久化表
+                    if let Some(ip) = arp_table.get(&normalized_mac) {
+                        PERSISTENT_ARP.lock().unwrap().update(normalized_mac.clone(), ip.clone());
+                        ip.clone()
+                    } else {
+                        // 都没有，使用未知标记
+                        "未知IP".to_string()
+                    }
+                })
             };
-
-            // 如果最终还是没有 VPN IP，跳过该条目
-            if final_vpn_ip.is_empty() {
-                log::warn!("Skipping peer: mac='{}', no VPN IP found (original='{}', arp_table_size={})",
-                           mac, vpn_ip, arp_table.len());
-                let _ = log_to_buffer("WARN", "anyn2n_lib::n2n::management",
-                    format!("Skipping peer: mac='{}', no VPN IP found (original='{}', arp_table_size={})", mac, vpn_ip, arp_table.len()));
-                continue;
-            }
 
             let last_seen: u64 = if parts.len() >= 6 { parts[5].trim().parse().unwrap_or(0) } else { 0 };
 
@@ -253,6 +338,47 @@ impl EdgeManagementClient {
                 connection_type: conn_type.to_string(),
                 last_seen,
             });
+        }
+
+        // 补充：从持久化ARP表 + 系统ARP表添加不在当前edges中的peer
+        {
+            let current_macs: Vec<String> = status.peers.iter().map(|p| p.mac_addr.to_lowercase().replace('-', ":")).collect();
+            // 合并持久化ARP和系统ARP，确保所有已知peer都被考虑
+            let mut all_arp_mac_to_ip: HashMap<String, String> = HashMap::new();
+
+            // 先从持久化ARP加载
+            let persist_arp = PERSISTENT_ARP.lock().unwrap();
+            for (mac, ip) in &persist_arp.mac_to_ip {
+                all_arp_mac_to_ip.insert(mac.clone(), ip.clone());
+            }
+            // 再从系统ARP表加载（会覆盖持久化表中的重复条目）
+            for (mac, ip) in &arp_table {
+                all_arp_mac_to_ip.insert(mac.clone(), ip.clone());
+            }
+            // 也考虑ip_to_mac方向（从持久化表补充可能缺失的MAC方向映射）
+            for (ip, mac) in &persist_arp.ip_to_mac {
+                if !all_arp_mac_to_ip.contains_key(mac) {
+                    all_arp_mac_to_ip.insert(mac.clone(), ip.clone());
+                }
+            }
+
+            for (mac, ip) in &all_arp_mac_to_ip {
+                // 跳过广播地址
+                if ip.ends_with(".255") { continue; }
+                if mac == "ff:ff:ff:ff:ff:ff" { continue; }
+                if !current_macs.contains(mac) && is_valid_ip(ip) && is_valid_mac(mac) {
+                    let conn_type = persist_arp.get_conn_type(mac).unwrap_or_else(|| "recent".to_string());
+                    log::debug!("  Supplementing peer from ARP: ip='{}', mac='{}', type='{}'", ip, mac, conn_type);
+                    let _ = log_to_buffer("DEBUG", "anyn2n_lib::n2n::management",
+                        format!("  Supplementing peer from ARP: ip='{}', mac='{}', type='{}'", ip, mac, conn_type));
+                    status.peers.push(PeerInfo {
+                        mac_addr: mac.clone(),
+                        ip_addr: ip.clone(),
+                        connection_type: conn_type,
+                        last_seen: 999,
+                    });
+                }
+            }
         }
 
         Ok(status)

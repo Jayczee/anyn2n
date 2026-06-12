@@ -332,11 +332,12 @@ fn nets_lock() -> &'static std::sync::Mutex<sysinfo::Networks> {
 
 #[tauri::command]
 pub async fn get_tap_stats() -> Result<TapStats, String> {
-    let iface_name = find_tap_iface();
     let mut nets = nets_lock().lock().unwrap();
-    nets.refresh(false); // 增量刷新，保留已有接口，received() 返回差值
+    nets.refresh(false);
+
     for (name, data) in nets.iter() {
-        if iface_name.as_ref().map_or(false, |n| name.contains(n.as_str())) {
+        let lower = name.to_lowercase();
+        if lower.contains("tap") || lower.contains("wintun") || lower.contains("n2n") {
             return Ok(TapStats {
                 rx_bytes: data.received(),
                 tx_bytes: data.transmitted(),

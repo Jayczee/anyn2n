@@ -11,10 +11,16 @@ use uuid::Uuid;
 pub struct ServerEntry {
     pub id: String,
     pub name: String,
+    #[serde(default = "default_protocol")]
+    pub protocol: String,
     pub ip: String,
     pub port: u16,
     pub default_group: String,
     pub created_at: u64,
+}
+
+fn default_protocol() -> String {
+    "n2n".to_string()
 }
 
 /// 持久化存储

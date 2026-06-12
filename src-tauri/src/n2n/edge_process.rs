@@ -1,12 +1,10 @@
 use anyhow::Result;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-#[cfg(target_os = "linux")]
-use std::process::Stdio;
+use rand::Rng;
 
 /// 创建不弹 CMD 窗口的子进程（Windows: CREATE_NO_WINDOW）
-#[cfg(any(windows, target_os = "linux"))]
 fn hidden_cmd(name: &str) -> Command {
     let mut c = Command::new(name);
     #[cfg(target_os = "windows")]
@@ -74,6 +72,19 @@ impl EdgeProcessManager {
             "-t".to_string(),
             self.management_port.to_string(),
         ];
+
+        // 随机MAC地址，避免冲突（完全随机，设置本地管理位）
+        let random_mac = format!(
+            "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            (rand::random::<u8>() & 0xFE) | 0x02, // 本地管理位，非组播
+            rand::random::<u8>(),
+            rand::random::<u8>(),
+            rand::random::<u8>(),
+            rand::random::<u8>(),
+            rand::random::<u8>()
+        );
+        args.push("-m".to_string());
+        args.push(random_mac);
 
         // 虚拟 IP：手动指定时传 -a static:IP，自动时不传（超节点自动分配）
         if let Some(ip) = virtual_ip {
@@ -295,8 +306,8 @@ impl EdgeProcessManager {
         // 先尝试通过管理端口优雅停止
         let _ = self.stop_via_management().await;
 
-        // 等待一小会儿
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        // 等待supernode释放资源
+        tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
 
         // 强制 kill
         let _ = self.kill_all_edges().await;
@@ -459,9 +470,10 @@ fn parse_edge_output(
             if line.contains("supernode not responding") {
                 *sn_connected.blocking_write() = false;
             }
-            // Peer P2P 通信也说明网络通路
-            if line.contains("[p2p]") {
+            // Peer P2P / 中转 通信也说明网络通路，同时提取MAC更新连接类型
+            if line.contains("[p2p]") || line.contains("[pSp]") {
                 *last_sn.blocking_write() = now();
+                crate::n2n::management::update_conn_type_from_edge_log(&line);
             }
         }
     }

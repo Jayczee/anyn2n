@@ -23,4 +23,6 @@ dist-ssr
 *.sln
 *.sw?
 *.md
-dist*/
+dist*/plan.md
+*/dist*
+dist*

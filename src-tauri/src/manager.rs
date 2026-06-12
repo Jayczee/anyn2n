@@ -1,4 +1,4 @@
-use crate::n2n::{EdgeManagementClient, EdgeProcessManager, EdgeStatus};
+use crate::n2n::{DiscoveryService, EdgeManagementClient, EdgeProcessManager, EdgeStatus};
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -24,12 +24,15 @@ pub struct ConnectionManager {
     status: Arc<RwLock<Option<EdgeStatus>>>,
     last_query: Arc<RwLock<Instant>>,
     connect_gen: Arc<RwLock<u64>>, // 连接代际，cancel/reconnect 时递增
+    discovery: DiscoveryService,
 }
 
 impl ConnectionManager {
     pub fn new() -> Self {
+        let edge_process = Arc::new(EdgeProcessManager::new());
         Self {
-            edge_process: Arc::new(EdgeProcessManager::new()),
+            discovery: DiscoveryService::new(edge_process.local_ip.clone()),
+            edge_process,
             status: Arc::new(RwLock::new(None)),
             last_query: Arc::new(RwLock::new(Instant::now())),
             connect_gen: Arc::new(RwLock::new(0)),
@@ -127,6 +130,7 @@ impl ConnectionManager {
     /// 断开连接
     pub async fn disconnect(&self) -> Result<()> {
         *self.connect_gen.write().await += 1; // 使所有进行中的 connect 失效
+        self.discovery.stop();
         self.edge_process.stop().await?;
         *self.status.write().await = None;
         self.add_log("已断开连接".to_string()).await;
@@ -158,29 +162,110 @@ impl ConnectionManager {
         }
         *self.last_query.write().await = now;
 
+        // 获取 VPN IP（提前获取，供 query_status 内部使用）
+        let lip = self.edge_process.local_ip.read().await.clone();
+
         let client = EdgeManagementClient::new(self.edge_process.management_port())?;
-        let mut status = client.query_status()?;
+        let mut status = client.query_status(&lip)?;
         if status.last_super > 60 {
             status.is_running = false;
         }
         // 用实时 SN 数据覆盖
         let sn = { let (_, _, s) = self.get_conn_state().await; s };
         if sn > 0 { status.last_super = sn; status.is_running = sn <= 45; }
-
-        // 获取 supernode 分配的 VPN IP（从已缓存的或通过 OS diff 检测）
-        let lip = self.edge_process.local_ip.read().await.clone();
         if !lip.is_empty() {
-            status.local_ip = lip;
+            status.local_ip = lip.clone();
         } else {
             let (_, sn_connected, _) = self.get_conn_state().await;
             if sn_connected {
                 if let Some(detected) = self.edge_process.detect_vpn_ip().await {
-                    status.local_ip = detected;
+                    status.local_ip = detected.clone();
                 }
             }
         }
+
+        // 首次连接成功且检测到VPN子网时，启动子网扫描和定期ping任务
+        if !status.local_ip.is_empty() && status.last_super < 45 {
+            let parts: Vec<&str> = status.local_ip.rsplitn(2, '.').collect();
+            if parts.len() == 2 {
+                let subnet = parts[1].to_string();
+                self.start_peer_discovery_once(subnet).await;
+            }
+        }
+
         *self.status.write().await = Some(status.clone());
         Ok(status)
+    }
+
+    /// 首次连接时启动发现服务（只执行一次）
+    async fn start_peer_discovery_once(&self, subnet: String) {
+        static DISCOVERY_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+        if DISCOVERY_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return; // 已启动过
+        }
+
+        log::info!("[Discovery] Starting discovery service for {}.x", subnet);
+
+        // 启动UDP广播发现监听器（后台线程）
+        self.discovery.start();
+
+        // 延迟5秒等edge完成supernode注册，然后发送发现广播
+        let subnet_clone = subnet.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            log::info!("[Discovery] Sending initial discovery broadcast");
+            DiscoveryService::send_discovery(&subnet_clone);
+
+            // 之后每30秒发送一次发现广播（轻量级，1次广播触达所有peer）
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                DiscoveryService::send_discovery(&subnet_clone);
+            }
+        });
+
+        // 定期ping持久化表中的已知peer，保持连接活跃
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+
+                let ips: Vec<String> = {
+                    crate::n2n::management::PERSISTENT_ARP.lock().unwrap()
+                        .ip_to_mac.keys().cloned().collect()
+                };
+
+                if !ips.is_empty() {
+                    let mut alive_ips = Vec::new();
+                    for ip in &ips {
+                        let mut alive = false;
+                        #[cfg(target_os = "windows")]
+                        {
+                            if let Ok(output) = tokio::process::Command::new("ping")
+                                .args(["-n", "1", "-w", "100", ip])
+                                .output()
+                                .await
+                            {
+                                alive = output.status.success();
+                            }
+                        }
+                        #[cfg(not(target_os = "windows"))]
+                        {
+                            if let Ok(output) = tokio::process::Command::new("ping")
+                                .args(["-c", "1", "-W", "1", ip])
+                                .output()
+                                .await
+                            {
+                                alive = output.status.success();
+                            }
+                        }
+                        if alive {
+                            alive_ips.push(ip.clone());
+                        }
+                    }
+                    log::info!("[Ping] Keep-alive ping to {} peers, {} responded: {:?}", ips.len(), alive_ips.len(), alive_ips);
+                }
+            }
+        });
     }
 
     /// 获取当前状态
