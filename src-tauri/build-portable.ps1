@@ -18,7 +18,7 @@ New-Item -ItemType Directory -Path $portableDir -Force | Out-Null
 
 Write-Host "Copying files..."
 # 主程序
-Copy-Item "target\release\tauri-native.exe" "$portableDir\anyn2n.exe" -Force
+Copy-Item "target\release\AnyN2N.exe" "$portableDir\anyn2n.exe" -Force
 
 # Manifest（UAC 提权）
 Copy-Item "resources\app.manifest" "$portableDir\anyn2n.exe.manifest" -Force
