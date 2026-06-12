@@ -332,10 +332,23 @@ fn nets_lock() -> &'static std::sync::Mutex<sysinfo::Networks> {
 
 #[tauri::command]
 pub async fn get_tap_stats() -> Result<TapStats, String> {
-    // 优先使用 sysinfo 读取真实网卡统计
+    // 先找到 TAP 网卡的 friendly_name（Windows 下如"以太网 2"）
+    let iface_name = find_tap_iface();
     let mut nets = nets_lock().lock().unwrap();
     nets.refresh(false);
 
+    for (name, data) in nets.iter() {
+        if iface_name.as_ref().map_or(false, |n| name.contains(n.as_str())) {
+            return Ok(TapStats {
+                rx_bytes: data.received(),
+                tx_bytes: data.transmitted(),
+                rx_packets: data.packets_received(),
+                tx_packets: data.packets_transmitted(),
+            });
+        }
+    }
+
+    // fallback: 没找到网卡名，直接用关键字匹配
     for (name, data) in nets.iter() {
         let lower = name.to_lowercase();
         if lower.contains("tap") || lower.contains("wintun") || lower.contains("n2n") {
@@ -348,7 +361,7 @@ pub async fn get_tap_stats() -> Result<TapStats, String> {
         }
     }
 
-    // sysinfo 找不到网卡（userspace-networking 模式），尝试读管理端口
+    // userspace-networking 模式下的 fallback：从 edge 管理口读包数
     if let Ok(client) = EdgeManagementClient::new(5644) {
         if let Ok(status) = client.query_status(&"".to_string()) {
             return Ok(TapStats {
