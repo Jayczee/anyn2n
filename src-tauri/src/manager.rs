@@ -133,6 +133,13 @@ impl ConnectionManager {
         self.discovery.stop();
         self.edge_process.stop().await?;
         *self.status.write().await = None;
+        // 清空持久化ARP表，避免旧peer残留
+        {
+            let mut arp = crate::n2n::management::PERSISTENT_ARP.lock().unwrap();
+            arp.mac_to_ip.clear();
+            arp.ip_to_mac.clear();
+            arp.mac_to_conn_type.clear();
+        }
         self.add_log("已断开连接".to_string()).await;
         Ok(())
     }
