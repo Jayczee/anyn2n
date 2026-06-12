@@ -1,5 +1,5 @@
 use crate::manager::ConnectionManager;
-use crate::n2n::{EdgeManagementClient, EdgeStatus};
+use crate::n2n::EdgeStatus;
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
@@ -332,23 +332,6 @@ fn nets_lock() -> &'static std::sync::Mutex<sysinfo::Networks> {
 
 #[tauri::command]
 pub async fn get_tap_stats() -> Result<TapStats, String> {
-    use std::sync::atomic::Ordering;
-    use crate::n2n::edge_process::{RX_BYTES, TX_BYTES, RX_PACKETS, TX_PACKETS};
-
-    // 主数据源：从 edge Tx/Rx PACKET 日志解析的计数器
-    // 这些计数器每次调用时读取并重置，返回增量值
-    let rx_bytes = RX_BYTES.swap(0, Ordering::Relaxed);
-    let tx_bytes = TX_BYTES.swap(0, Ordering::Relaxed);
-    let rx_packets = RX_PACKETS.swap(0, Ordering::Relaxed);
-    let tx_packets = TX_PACKETS.swap(0, Ordering::Relaxed);
-
-    if rx_bytes > 0 || tx_bytes > 0 || rx_packets > 0 || tx_packets > 0 {
-        log::debug!("[Stats] from edge PACKET log: rx_bytes={}, tx_bytes={}, rx_pkts={}, tx_pkts={}",
-            rx_bytes, tx_bytes, rx_packets, tx_packets);
-        return Ok(TapStats { rx_bytes, tx_bytes, rx_packets, tx_packets });
-    }
-
-    // fallback: sysinfo（兼容旧版 edge 不输出 PACKET 日志的情况）
     let iface_name = find_tap_iface();
     let mut nets = nets_lock().lock().unwrap();
     nets.refresh(false);
