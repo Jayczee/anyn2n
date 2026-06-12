@@ -332,47 +332,62 @@ fn nets_lock() -> &'static std::sync::Mutex<sysinfo::Networks> {
 
 #[tauri::command]
 pub async fn get_tap_stats() -> Result<TapStats, String> {
-    // 先找到 TAP 网卡的 friendly_name（Windows 下如"以太网 2"）
     let iface_name = find_tap_iface();
+    log::info!("[Stats] find_tap_iface() returned: {:?}", iface_name);
+
     let mut nets = nets_lock().lock().unwrap();
     nets.refresh(false);
 
-    for (name, data) in nets.iter() {
-        if iface_name.as_ref().map_or(false, |n| name.contains(n.as_str())) {
-            return Ok(TapStats {
-                rx_bytes: data.received(),
-                tx_bytes: data.transmitted(),
-                rx_packets: data.packets_received(),
-                tx_packets: data.packets_transmitted(),
-            });
+    // 打印所有网卡名用于排查
+    let all_names: Vec<&str> = nets.iter().map(|(n, _)| n.as_str()).collect();
+    log::info!("[Stats] sysinfo Networks count={}, names={:?}", all_names.len(), all_names);
+
+    // Path 1: 用 ipconfig 找到的 friendly_name 匹配
+    if let Some(ref name) = iface_name {
+        for (sys_name, data) in nets.iter() {
+            if sys_name.contains(name.as_str()) {
+                let rx_b = data.received();
+                let tx_b = data.transmitted();
+                let rx_p = data.packets_received();
+                let tx_p = data.packets_transmitted();
+                log::info!("[Stats] PATH1(ipconfig match) iface='{}', rx_bytes={}, tx_bytes={}, rx_pkts={}, tx_pkts={}",
+                    sys_name, rx_b, tx_b, rx_p, tx_p);
+                return Ok(TapStats { rx_bytes: rx_b, tx_bytes: tx_b, rx_packets: rx_p, tx_packets: tx_p });
+            }
         }
+        log::warn!("[Stats] PATH1 FAILED: iface_name='{}' not found in sysinfo names", name);
     }
 
-    // fallback: 没找到网卡名，直接用关键字匹配
-    for (name, data) in nets.iter() {
-        let lower = name.to_lowercase();
+    // Path 2: 关键字直接匹配
+    for (sys_name, data) in nets.iter() {
+        let lower = sys_name.to_lowercase();
         if lower.contains("tap") || lower.contains("wintun") || lower.contains("n2n") {
-            return Ok(TapStats {
-                rx_bytes: data.received(),
-                tx_bytes: data.transmitted(),
-                rx_packets: data.packets_received(),
-                tx_packets: data.packets_transmitted(),
-            });
+            let rx_b = data.received();
+            let tx_b = data.transmitted();
+            let rx_p = data.packets_received();
+            let tx_p = data.packets_transmitted();
+            log::info!("[Stats] PATH2(keyword match) iface='{}', rx_bytes={}, tx_bytes={}, rx_pkts={}, tx_pkts={}",
+                sys_name, rx_b, tx_b, rx_p, tx_p);
+            return Ok(TapStats { rx_bytes: rx_b, tx_bytes: tx_b, rx_packets: rx_p, tx_packets: tx_p });
         }
     }
 
-    // userspace-networking 模式下的 fallback：从 edge 管理口读包数
+    // Path 3: edge 管理端口 fallback
     if let Ok(client) = EdgeManagementClient::new(5644) {
-        if let Ok(status) = client.query_status(&"".to_string()) {
-            return Ok(TapStats {
-                rx_bytes: 0,
-                tx_bytes: 0,
-                rx_packets: status.rx_packets,
-                tx_packets: status.tx_packets,
-            });
+        match client.query_status(&"".to_string()) {
+            Ok(status) => {
+                log::info!("[Stats] PATH3(mgmt port) tx_pkts={}, rx_pkts={}",
+                    status.tx_packets, status.rx_packets);
+                return Ok(TapStats {
+                    rx_bytes: 0, tx_bytes: 0,
+                    rx_packets: status.rx_packets, tx_packets: status.tx_packets,
+                });
+            }
+            Err(e) => log::warn!("[Stats] PATH3 FAILED: mgmt query error: {}", e),
         }
     }
 
+    log::warn!("[Stats] ALL PATHS FAILED, returning zeros");
     Ok(TapStats { rx_bytes: 0, tx_bytes: 0, rx_packets: 0, tx_packets: 0 })
 }
 
