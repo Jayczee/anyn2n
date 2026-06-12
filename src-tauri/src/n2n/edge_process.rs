@@ -1,8 +1,15 @@
 use anyhow::Result;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 use rand::Rng;
+
+// 全局网络统计计数器（从 edge 的 Tx/Rx PACKET 日志解析）
+pub static RX_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static TX_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static RX_PACKETS: AtomicU64 = AtomicU64::new(0);
+pub static TX_PACKETS: AtomicU64 = AtomicU64::new(0);
 
 /// 创建不弹 CMD 窗口的子进程（Windows: CREATE_NO_WINDOW）
 fn hidden_cmd(name: &str) -> Command {
@@ -430,8 +437,19 @@ fn parse_edge_output(
     let buf = std::io::BufReader::new(reader);
     for line in buf.lines() {
         if let Ok(line) = line {
-            // 过滤掉高频的数据包传输日志
-            if line.contains("Tx PACKET") || line.contains("Rx PACKET") {
+            // 解析 Tx/Rx PACKET 日志提取字节/包数统计
+            if line.contains("Tx PACKET") {
+                TX_PACKETS.fetch_add(1, Ordering::Relaxed);
+                if let Some(bytes) = extract_bytes_from_packet_line(&line) {
+                    TX_BYTES.fetch_add(bytes, Ordering::Relaxed);
+                }
+                continue;
+            }
+            if line.contains("Rx PACKET") {
+                RX_PACKETS.fetch_add(1, Ordering::Relaxed);
+                if let Some(bytes) = extract_bytes_from_packet_line(&line) {
+                    RX_BYTES.fetch_add(bytes, Ordering::Relaxed);
+                }
                 continue;
             }
 
@@ -477,6 +495,15 @@ fn parse_edge_output(
             }
         }
     }
+}
+
+/// 从 Tx/Rx PACKET 日志行中提取字节数
+/// 例如 "Tx PACKET (143 bytes) to ..." → Some(143)
+fn extract_bytes_from_packet_line(line: &str) -> Option<u64> {
+    // 查找 "(NNN bytes)" 模式
+    let start = line.find("(")? + 1;
+    let end = line[start..].find(" bytes")?;
+    line[start..start + end].trim().parse().ok()
 }
 
 /// 从字符串中提取冒号后面紧跟的 IP 地址

@@ -332,62 +332,38 @@ fn nets_lock() -> &'static std::sync::Mutex<sysinfo::Networks> {
 
 #[tauri::command]
 pub async fn get_tap_stats() -> Result<TapStats, String> {
-    let iface_name = find_tap_iface();
-    log::info!("[Stats] find_tap_iface() returned: {:?}", iface_name);
+    use std::sync::atomic::Ordering;
+    use crate::n2n::edge_process::{RX_BYTES, TX_BYTES, RX_PACKETS, TX_PACKETS};
 
+    // 主数据源：从 edge Tx/Rx PACKET 日志解析的计数器
+    // 这些计数器每次调用时读取并重置，返回增量值
+    let rx_bytes = RX_BYTES.swap(0, Ordering::Relaxed);
+    let tx_bytes = TX_BYTES.swap(0, Ordering::Relaxed);
+    let rx_packets = RX_PACKETS.swap(0, Ordering::Relaxed);
+    let tx_packets = TX_PACKETS.swap(0, Ordering::Relaxed);
+
+    if rx_bytes > 0 || tx_bytes > 0 || rx_packets > 0 || tx_packets > 0 {
+        log::debug!("[Stats] from edge PACKET log: rx_bytes={}, tx_bytes={}, rx_pkts={}, tx_pkts={}",
+            rx_bytes, tx_bytes, rx_packets, tx_packets);
+        return Ok(TapStats { rx_bytes, tx_bytes, rx_packets, tx_packets });
+    }
+
+    // fallback: sysinfo（兼容旧版 edge 不输出 PACKET 日志的情况）
+    let iface_name = find_tap_iface();
     let mut nets = nets_lock().lock().unwrap();
     nets.refresh(false);
 
-    // 打印所有网卡名用于排查
-    let all_names: Vec<&str> = nets.iter().map(|(n, _)| n.as_str()).collect();
-    log::info!("[Stats] sysinfo Networks count={}, names={:?}", all_names.len(), all_names);
-
-    // Path 1: 用 ipconfig 找到的 friendly_name 匹配
-    if let Some(ref name) = iface_name {
-        for (sys_name, data) in nets.iter() {
-            if sys_name.contains(name.as_str()) {
-                let rx_b = data.received();
-                let tx_b = data.transmitted();
-                let rx_p = data.packets_received();
-                let tx_p = data.packets_transmitted();
-                log::info!("[Stats] PATH1(ipconfig match) iface='{}', rx_bytes={}, tx_bytes={}, rx_pkts={}, tx_pkts={}",
-                    sys_name, rx_b, tx_b, rx_p, tx_p);
-                return Ok(TapStats { rx_bytes: rx_b, tx_bytes: tx_b, rx_packets: rx_p, tx_packets: tx_p });
-            }
-        }
-        log::warn!("[Stats] PATH1 FAILED: iface_name='{}' not found in sysinfo names", name);
-    }
-
-    // Path 2: 关键字直接匹配
-    for (sys_name, data) in nets.iter() {
-        let lower = sys_name.to_lowercase();
-        if lower.contains("tap") || lower.contains("wintun") || lower.contains("n2n") {
-            let rx_b = data.received();
-            let tx_b = data.transmitted();
-            let rx_p = data.packets_received();
-            let tx_p = data.packets_transmitted();
-            log::info!("[Stats] PATH2(keyword match) iface='{}', rx_bytes={}, tx_bytes={}, rx_pkts={}, tx_pkts={}",
-                sys_name, rx_b, tx_b, rx_p, tx_p);
-            return Ok(TapStats { rx_bytes: rx_b, tx_bytes: tx_b, rx_packets: rx_p, tx_packets: tx_p });
+    for (name, data) in nets.iter() {
+        if iface_name.as_ref().map_or(false, |n| name.contains(n.as_str())) {
+            return Ok(TapStats {
+                rx_bytes: data.received(),
+                tx_bytes: data.transmitted(),
+                rx_packets: data.packets_received(),
+                tx_packets: data.packets_transmitted(),
+            });
         }
     }
 
-    // Path 3: edge 管理端口 fallback
-    if let Ok(client) = EdgeManagementClient::new(5644) {
-        match client.query_status(&"".to_string()) {
-            Ok(status) => {
-                log::info!("[Stats] PATH3(mgmt port) tx_pkts={}, rx_pkts={}",
-                    status.tx_packets, status.rx_packets);
-                return Ok(TapStats {
-                    rx_bytes: 0, tx_bytes: 0,
-                    rx_packets: status.rx_packets, tx_packets: status.tx_packets,
-                });
-            }
-            Err(e) => log::warn!("[Stats] PATH3 FAILED: mgmt query error: {}", e),
-        }
-    }
-
-    log::warn!("[Stats] ALL PATHS FAILED, returning zeros");
     Ok(TapStats { rx_bytes: 0, tx_bytes: 0, rx_packets: 0, tx_packets: 0 })
 }
 
